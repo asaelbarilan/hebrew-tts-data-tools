@@ -1,0 +1,8 @@
+gradio
+pandas
+datasets
+pydub
+soundfile
+tqdm
+numpy
+pyarrow
