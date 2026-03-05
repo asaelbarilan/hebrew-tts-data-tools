@@ -1,0 +1,20 @@
+prepare_ivritai:
+  input_folder: "C:/Users/Asael/PycharmProjects/crowd-recital"
+  output_dataset_name: "C:/Users/Asael/PycharmProjects/tts-data-tools/data/CrowdRecital_ivritai"
+  audio_filename_glob: "audio.wav"
+  segments_filename_glob: "transcript.aligned.json"
+  max_duration: 30.0
+  min_duration: 5.0
+  target_duration: 20.0
+  max_source_entries: null
+  validation_split_size: 0
+  num_proc: 1
+  per_proc_per_chunk_size: 10
+  per_sample_quality_threshold: 0.6
+  per_segment_quality_threshold: 0.6
+  copy_metadata_fields: []
+  exclude_by_md: []
+  push_to_hub: false
+  push_as_public: false
+  clear_output_dataset_cache_files: false
+  log_level: "INFO"

@@ -6,25 +6,36 @@ from pathlib import Path
 from typing import Iterator
 import uuid
 import statistics
+import io
+import sys
 
 from tqdm import tqdm
-from torchcodec.decoders import AudioDecoder
-from torchcodec.encoders import AudioEncoder
-from torchcodec import AudioSamples
 from datasets import (
     Dataset,
     DatasetDict,
     concatenate_datasets,
-    Audio as AudioColumnType,
     Value as ValueColumnType,
     Features,
 )
+from datasets.exceptions import DatasetGenerationError
 from huggingface_hub import DatasetCard, DatasetCardData, upload_file
-from f5_tts.train.datasets.heb_norm.hebrew_tts_normalizer import (
-    normalize_tts_text,
-    load_word_replacements,
-    TTSNormalizeOptions,
-)
+try:
+    # Original import path used in clean_f5 environment.
+    from f5_tts.train.datasets.heb_norm.hebrew_tts_normalizer import (
+        normalize_tts_text,
+        load_word_replacements,
+        TTSNormalizeOptions,
+    )
+except ModuleNotFoundError:
+    # Standalone fallback for this repo: use local normalizer module.
+    _normalizer_dir = Path(__file__).resolve().parents[1] / "normalizer"
+    if str(_normalizer_dir) not in sys.path:
+        sys.path.insert(0, str(_normalizer_dir))
+    from hebrew_tts_normalizer import (  # type: ignore
+        normalize_tts_text,
+        load_word_replacements,
+        TTSNormalizeOptions,
+    )
 
 
 @dataclass
@@ -61,6 +72,51 @@ class Segment:
 logger = logging.getLogger(__name__)
 
 
+def _load_cli_config(config_path: str) -> dict:
+    config_path_obj = Path(config_path)
+    if not config_path_obj.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    suffix = config_path_obj.suffix.lower()
+    with open(config_path_obj, "r", encoding="utf-8") as f:
+        if suffix == ".json":
+            config = json.load(f)
+        elif suffix in {".yaml", ".yml"}:
+            try:
+                import yaml
+            except ImportError as exc:
+                raise ImportError(
+                    "YAML config requested but PyYAML is not installed. "
+                    "Install with: pip install pyyaml"
+                ) from exc
+            config = yaml.safe_load(f)
+        else:
+            raise ValueError(
+                f"Unsupported config extension '{suffix}'. Use .json/.yaml/.yml"
+            )
+
+    if not isinstance(config, dict):
+        raise ValueError("Config root must be a JSON/YAML object.")
+
+    # Optional nesting: allow top-level {"prepare_ivritai": {...}}
+    nested = config.get("prepare_ivritai")
+    if isinstance(nested, dict):
+        return nested
+    return config
+
+
+def _merge_config_into_args(args, parser, config: dict):
+    for key, value in config.items():
+        if not hasattr(args, key):
+            logger.warning(f"Ignoring unknown config key: {key}")
+            continue
+        current = getattr(args, key)
+        default = parser.get_default(key)
+        # CLI wins over config; config fills unset/default values.
+        if current is None or current == default:
+            setattr(args, key, value)
+
+
 def _load_data_manifest(
     input_folder: Path,
     audio_filename_glob: str,
@@ -91,6 +147,7 @@ def _load_data_manifest(
 from subprocess import CalledProcessError, run, PIPE, DEVNULL
 
 import numpy as np
+import soundfile as sf
 
 TARGET_SAMPLE_RATE = 24_000
 
@@ -132,7 +189,8 @@ def load_audio_in_target_format(file: str, sr: int = TARGET_SAMPLE_RATE):
     try:
         out = run(cmd, capture_output=True, check=True).stdout
     except CalledProcessError as e:
-        raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
+        stderr_text = (e.stderr or b"").decode("utf-8", errors="replace")
+        raise RuntimeError(f"Failed to load audio: {stderr_text}") from e
 
     return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
 
@@ -496,14 +554,31 @@ def merge_slice_segments(
     return result_slices
 
 
-def get_slice_audio_samples(
-    audio_decoder: AudioDecoder, slice, slice_length
-) -> AudioSamples:
-    audio_start_sec = slice["seek"]
-    audio_samples = audio_decoder.get_samples_played_in_range(
-        audio_start_sec, audio_start_sec + slice_length
+def get_slice_audio_waveform(
+    audio_waveform: np.ndarray, slice_start_sec: float, slice_length_sec: float
+) -> np.ndarray:
+    """Slice mono waveform using time range (seconds)."""
+    start_sample = max(0, int(round(slice_start_sec * TARGET_SAMPLE_RATE)))
+    end_sample = max(
+        start_sample,
+        int(round((slice_start_sec + slice_length_sec) * TARGET_SAMPLE_RATE)),
     )
-    return audio_samples
+    return audio_waveform[start_sample:end_sample]
+
+
+def encode_wav_bytes(audio_waveform: np.ndarray) -> bytes:
+    """Encode float waveform as WAV bytes for HF Audio column."""
+    if audio_waveform.size == 0:
+        return b""
+    wav_bytes_buffer = io.BytesIO()
+    sf.write(
+        wav_bytes_buffer,
+        audio_waveform,
+        TARGET_SAMPLE_RATE,
+        format="WAV",
+        subtype="PCM_16",
+    )
+    return wav_bytes_buffer.getvalue()
 
 
 word_replacement_cache = None
@@ -526,8 +601,9 @@ def cleanup_text(text: str) -> str:
 
 def generate_examples_from_slices(
     slices,
-    audio_file: str,
+    audio_waveform: np.ndarray,
     metadata: dict,
+    min_duration: float = 0.0,
     copy_metadata_fields: list[str] = [],
 ) -> Iterator[dict]:
     source_id = metadata.get("source_id", "unknown")
@@ -545,9 +621,6 @@ def generate_examples_from_slices(
         return None
 
     prev_example = None
-    audio_decoder = AudioDecoder(
-        str(audio_file), sample_rate=TARGET_SAMPLE_RATE, num_channels=1
-    )
     for slice in slices:
         if slice["segments"]:
             try:
@@ -562,18 +635,16 @@ def generate_examples_from_slices(
                 ]
                 segments_quality_score = calculate_median_quality_score(all_word_scores)
                 slice_duration = slice.get("duration", 0.0)
-                slice_audio_samples = get_slice_audio_samples(
-                    audio_decoder, slice, slice_duration
+                if slice_duration < min_duration:
+                    continue
+                slice_audio_waveform = get_slice_audio_waveform(
+                    audio_waveform, float(slice["seek"]), slice_duration
                 )
-                audio_encoder = AudioEncoder(
-                    slice_audio_samples.data, sample_rate=TARGET_SAMPLE_RATE
-                )
+                slice_audio_bytes = encode_wav_bytes(slice_audio_waveform)
                 example = {
                     "audio": {
-                        "bytes": audio_encoder.to_tensor(format="mp3")
-                        .numpy()
-                        .tobytes(),
-                        "path": source_entry_id,
+                        "bytes": slice_audio_bytes,
+                        "path": f"{source_entry_id}.wav",
                     },
                     "text": cleanup_text(slice_text),
                     "raw_text": slice_text,
@@ -602,9 +673,6 @@ def generate_examples_from_slices(
                 logger.error(
                     f"Error processing slice seek {float(slice['seek']):.2f} in {source_id}:{source_entry_id}: {e}"
                 )
-                if "Could not push packet to decoder" in str(e):
-                    # we cannot recover from this
-                    break
         else:
             prev_example = None
 
@@ -718,7 +786,7 @@ def prepare_training_dataset(
     def _get_manifest_duration(entry):
         metadata_file = entry[2]
         try:
-            with open(metadata_file, "r") as f:
+            with open(metadata_file, "r", encoding="utf-8") as f:
                 md = json.load(f)
             duration = md.get("duration", md.get("session_duration", None))
             if duration is None:
@@ -753,7 +821,7 @@ def prepare_training_dataset(
         for audio_file, segments_data_file, metadata_file in input_manifest_shards:
             try:
                 # Load metadata first to check exclusion filters
-                with open(metadata_file, "r") as f:
+                with open(metadata_file, "r", encoding="utf-8") as f:
                     metadata = json.load(f)
 
                 # Check if entry should be excluded based on metadata filters
@@ -765,7 +833,7 @@ def prepare_training_dataset(
 
                 # Load captions
                 segments = []
-                with open(segments_data_file, "r") as segs_file:
+                with open(segments_data_file, "r", encoding="utf-8") as segs_file:
                     segs_json = json.load(segs_file)
                     segments: list[Segment] = [
                         Segment(**s) if isinstance(s, dict) else s
@@ -785,11 +853,11 @@ def prepare_training_dataset(
                     )
                     continue
 
-                # Load Audio (streams output from an FFMPEG process for memory efficiency)
-                audio_decoder = AudioDecoder(
-                    str(audio_file), sample_rate=TARGET_SAMPLE_RATE, num_channels=1
+                # Load audio as mono waveform in target sample rate
+                audio_waveform = load_audio_in_target_format(
+                    str(audio_file), sr=TARGET_SAMPLE_RATE
                 )
-                audio_duration = audio_decoder.metadata.duration_seconds
+                audio_duration = len(audio_waveform) / TARGET_SAMPLE_RATE
 
                 # Create slices of the captions with the intended slice
                 slices = generate_slices(
@@ -805,19 +873,33 @@ def prepare_training_dataset(
                 # Generate the dataset
                 for example in generate_examples_from_slices(
                     slices,
-                    audio_file,
+                    audio_waveform,
                     metadata,
-                    copy_metadata_fields,
+                    min_duration=min_duration,
+                    copy_metadata_fields=copy_metadata_fields,
                 ):
                     yielded_at_least_one = True
                     yield example
-
-                if not yielded_at_least_one:
-                    # ensure at least one (empty) example is returned from this generator
-                    # to overcome Dataset "from_generator" bug
-                    yield {"text": ""}
             except Exception as e:
                 logger.error(f"Error processing {audio_file}: {e}")
+
+        if not yielded_at_least_one:
+            # Ensure at least one schema-valid row so from_generator doesn't crash on empty shard.
+            # This row is removed by the downstream .filter(lambda example: example["text"]).
+            yield {
+                "audio": {"bytes": b"", "path": ""},
+                "text": "",
+                "raw_text": "",
+                "metadata": {
+                    "seek": 0.0,
+                    "duration": 0.0,
+                    "source": "",
+                    "entry_id": "",
+                    "quality_score": 0.0,
+                },
+                "has_prev": False,
+                "prev_text": "",
+            }
 
     input_manifest_chunks = [
         input_manifest[i : i + manifest_processing_chunk_size]
@@ -838,7 +920,10 @@ def prepare_training_dataset(
         try:
             dataset_features = Features(
                 {
-                    "audio": AudioColumnType(),
+                    "audio": {
+                        "bytes": ValueColumnType(dtype="binary"),
+                        "path": ValueColumnType(dtype="string"),
+                    },
                     "text": ValueColumnType(dtype="string"),
                     "raw_text": ValueColumnType(dtype="string"),
                     "metadata": {
@@ -859,7 +944,12 @@ def prepare_training_dataset(
                     )
             generator_kwargs = {}
             if num_proc > 1:
-                generator_kwargs["num_proc"] = num_proc
+                if sys.platform.startswith("win"):
+                    logger.warning(
+                        "num_proc>1 is unstable on Windows with from_generator; falling back to single process."
+                    )
+                else:
+                    generator_kwargs["num_proc"] = num_proc
             generated_dataset = Dataset.from_generator(
                 examples_from_entry_generator,
                 gen_kwargs={"input_manifest_shards": list(input_manifest_chunk)},
@@ -868,8 +958,8 @@ def prepare_training_dataset(
             ).filter(
                 lambda example: example["text"]
             )  # filter out empty examples
-        except ValueError as e:
-            if "corresponds to no data" in str(e):
+        except (ValueError, DatasetGenerationError) as e:
+            if "corresponds to no data" in str(e) or "An error occurred while generating the dataset" in str(e):
                 logger.info("Skipping dataset creation because no data was found.")
                 continue
             else:
@@ -881,9 +971,6 @@ def prepare_training_dataset(
         return None
 
     examples_dataset = concatenate_datasets(all_datasets)
-    examples_dataset = examples_dataset.cast_column(
-        "audio", AudioColumnType(sampling_rate=TARGET_SAMPLE_RATE)
-    )
 
     return examples_dataset
 
@@ -895,7 +982,15 @@ if __name__ == "__main__":
         description="CLI to prepare a training dataset from the ivrit.ai normalized datasets"
     )
     parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional JSON/YAML config file. CLI values override config values.",
+    )
+    parser.add_argument(
         "input_folder",
+        nargs="?",
+        default=None,
         help="Path to the folder containing audio, transcript, and metadata data in the normalized structure",
     )
     parser.add_argument(
@@ -1044,6 +1139,14 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    # Merge config file into argparse namespace (CLI args override config values)
+    if args.config:
+        config_data = _load_cli_config(args.config)
+        _merge_config_into_args(args, parser, config_data)
+
+    if not args.input_folder:
+        parser.error("input_folder is required (either positional arg or provided via --config)")
 
     # Configure Logger
     numeric_level = getattr(logging, args.log_level.upper(), None)

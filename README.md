@@ -47,6 +47,15 @@ python data_prep/prepare_ivritai.py
 
 After prep completes, run normalization on the text you will actually train with (either in your prep flow or as a post-step).
 
+### Config-based run (recommended)
+
+Use `configs/prepare_ivritai.yaml` to avoid long CLI commands.  
+Update `input_folder` and `output_dataset_name`, then run:
+
+```bash
+python data_prep/prepare_ivritai.py --config configs/prepare_ivritai.yaml
+```
+
 ## UI audit
 
 ```bash
@@ -58,4 +67,12 @@ Optionally set data path:
 
 ```bash
 set DATA_PATH=C:\path\to\your\dataset
+```
+
+## Output sample player
+
+To listen to prepared output samples:
+
+```bash
+python ui/output_samples_app.py --data_path data/CrowdRecital_ivritai
 ```
